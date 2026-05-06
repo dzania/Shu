@@ -1,35 +1,22 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::Path,
-};
+use std::{fs::OpenOptions, path::Path};
 
 use crate::{
-    error::Result,
+    error::{Result, ShuError},
     storage::{
+        FileStorage,
+        btree::init_leaf_page,
         header::{DatabaseHeader, FREELIST_DEFAULT, INITIAL_ROOT_PAGE_ID},
-        page::{PAGE_SIZE, Page, PageId, PageType},
+        page::{Page, PageId, PageType},
     },
 };
 
 const META_PAGE_ID: PageId = PageId::new(0);
 
 #[derive(Debug)]
-// TODO: This should be a trait for in memory storage too
-pub struct FileStorage {
-    file: File,
-}
-
-impl FileStorage {
-    fn new(file: File) -> Self {
-        Self { file }
-    }
-}
-
-#[derive(Debug)]
 pub struct Pager {
     pub(crate) page_count: u32,
     storage: FileStorage,
+    root_page_id: PageId,
     freelist_head: u32,
 }
 
@@ -53,6 +40,7 @@ impl Pager {
             Ok(Self {
                 page_count: header.page_count,
                 freelist_head: header.freelist_head,
+                root_page_id: header.root_page_id,
                 storage,
             })
         } else {
@@ -66,18 +54,28 @@ impl Pager {
             };
             header.write_to(&mut meta_page)?;
             storage.write_page(META_PAGE_ID, &meta_page)?;
-            let root_page = Page::new(PageType::Leaf, INITIAL_ROOT_PAGE_ID);
+            let mut root_page = Page::new(PageType::Leaf, INITIAL_ROOT_PAGE_ID);
+            init_leaf_page(&mut root_page)?;
             storage.write_page(INITIAL_ROOT_PAGE_ID, &root_page)?;
 
             Ok(Self {
                 page_count: 2,
                 freelist_head: FREELIST_DEFAULT,
+                root_page_id: INITIAL_ROOT_PAGE_ID,
                 storage,
             })
         }
     }
 
+    pub(crate) fn root_page_id(&self) -> PageId {
+        self.root_page_id
+    }
+
     pub fn read_page(&mut self, page_id: PageId) -> Result<Page> {
+        if page_id.get() >= self.page_count {
+            return Err(ShuError::PageNotFound { page_id });
+        }
+
         self.storage.read_page(page_id)
     }
 
@@ -90,12 +88,19 @@ impl Pager {
     }
 
     pub fn write_page(&mut self, page_id: PageId, page: &Page) -> Result<()> {
+        if page_id.get() >= self.page_count {
+            return Err(ShuError::PageNotFound { page_id });
+        }
+
         self.storage.write_page(page_id, page)
     }
 
     pub fn allocate(&mut self, page_type: PageType) -> Result<PageId> {
         let page_id = PageId::new(self.page_count);
-        let page = Page::new(page_type, page_id);
+        let mut page = Page::new(page_type, page_id);
+        if page_type == PageType::Leaf {
+            init_leaf_page(&mut page)?;
+        }
         self.storage.write_page(page_id, &page)?;
         self.page_count += 1;
         self.flush_meta()?;
@@ -103,41 +108,18 @@ impl Pager {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.storage.file.sync_all()?;
-        Ok(())
+        self.storage.sync()
     }
 
     fn flush_meta(&mut self) -> Result<()> {
         let mut meta_page = self.read_meta()?;
         let mut header = DatabaseHeader::read_from(&meta_page)?;
         header.page_count = self.page_count;
+        header.root_page_id = self.root_page_id;
         header.freelist_head = self.freelist_head;
         header.write_to(&mut meta_page)?;
         self.write_meta(&meta_page)?;
         Ok(())
-    }
-}
-
-impl FileStorage {
-    fn read_page(&mut self, page_id: PageId) -> Result<Page> {
-        let offset = page_id.as_u64() * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut page = Page {
-            data: [0u8; PAGE_SIZE],
-        };
-        self.file.read_exact(&mut page.data)?;
-        Ok(page)
-    }
-
-    fn write_page(&mut self, page_id: PageId, page: &Page) -> Result<()> {
-        let offset = page_id.as_u64() * PAGE_SIZE as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&page.data)?;
-        Ok(())
-    }
-
-    fn file_len(&mut self) -> Result<u64> {
-        Ok(self.file.seek(SeekFrom::End(0))?)
     }
 }
 

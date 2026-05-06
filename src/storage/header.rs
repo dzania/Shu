@@ -19,11 +19,11 @@ impl DatabaseHeader {
     pub fn read_from(page: &Page) -> Result<Self> {
         let page_id = page.id();
 
-        if page.page_type() != Some(PageType::Meta) {
+        if page.page_type()? != PageType::Meta {
             return Err(ShuError::CorruptedPage { page_id });
         }
 
-        let header = page.read_body_prefix::<Self>();
+        let header = page.read_body_prefix::<Self>()?;
         header.validate(page_id)?;
         Ok(header)
     }
@@ -31,12 +31,12 @@ impl DatabaseHeader {
     pub fn write_to(&self, page: &mut Page) -> Result<()> {
         let page_id = page.id();
 
-        if page.page_type() != Some(PageType::Meta) {
+        if page.page_type()? != PageType::Meta {
             return Err(ShuError::CorruptedPage { page_id });
         }
 
         self.validate(page_id)?;
-        page.write_body_prefix(self);
+        page.write_body_prefix(self)?;
 
         Ok(())
     }

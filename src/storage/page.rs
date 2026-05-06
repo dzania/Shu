@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytemuck::{from_bytes, from_bytes_mut};
 
-use crate::error::ShuError;
+use crate::error::{Result, ShuError};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const HEADER_SIZE: usize = 16;
@@ -54,7 +54,7 @@ pub enum PageType {
 impl TryFrom<u8> for PageType {
     type Error = ShuError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self> {
         match value {
             1 => Ok(Self::Meta),
             2 => Ok(Self::Internal),
@@ -80,6 +80,7 @@ pub struct PageHeader {
     pub _reserved2: [u8; 4], // 4 bytes
 } // total: 16 byte
 
+// Lowest level page frame
 #[repr(C, align(4))]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
@@ -106,8 +107,15 @@ impl Page {
         self.header().page_id
     }
 
-    pub fn page_type(&self) -> Option<PageType> {
-        self.header().page_type.try_into().ok()
+    pub fn page_type(&self) -> Result<PageType> {
+        self.header().page_type.try_into()
+    }
+
+    pub fn assert_page_type(&self, expected: PageType) -> Result<()> {
+        if self.page_type()? != expected {
+            return Err(ShuError::InvalidPageType);
+        }
+        Ok(())
     }
 
     pub fn body(&self) -> &[u8] {
@@ -118,13 +126,22 @@ impl Page {
         &mut self.data[HEADER_SIZE..]
     }
 
-    pub fn read_body_prefix<T: bytemuck::Pod>(&self) -> T {
+    pub fn read_body_prefix<T: bytemuck::Pod>(&self) -> Result<T> {
         let len = size_of::<T>();
-        bytemuck::pod_read_unaligned(&self.body()[..len])
+        if len > self.body().len() {
+            return Err(ShuError::CorruptedPage { page_id: self.id() });
+        }
+
+        Ok(bytemuck::pod_read_unaligned(&self.body()[..len]))
     }
 
-    pub fn write_body_prefix<T: bytemuck::Pod>(&mut self, value: &T) {
+    pub fn write_body_prefix<T: bytemuck::Pod>(&mut self, value: &T) -> Result<()> {
         let len = size_of::<T>();
+        if len > self.body().len() {
+            return Err(ShuError::CorruptedPage { page_id: self.id() });
+        }
+
         self.body_mut()[..len].copy_from_slice(bytemuck::bytes_of(value));
+        Ok(())
     }
 }
