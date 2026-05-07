@@ -150,6 +150,21 @@ impl Page {
         Ok(())
     }
 
+    pub(crate) fn read_body_u16(&self, offset: usize) -> Result<u16> {
+        let end = offset + size_of::<u16>();
+        assert!(end < self.body().len());
+        // FIXME: Handle error properly
+        Ok(u16::from_le_bytes(
+            self.body()[offset..end].try_into().unwrap(),
+        ))
+    }
+
+    pub(crate) fn read_body_bytes(&self, range: Range<usize>) -> Result<&[u8]> {
+        self.validate_body_range(&range)?;
+        let bytes = &self.body()[range];
+        Ok(bytes)
+    }
+
     fn validate_body_range(&self, range: &Range<usize>) -> Result<()> {
         if range.start > range.end || range.end > self.body().len() {
             return Err(self.invalid_body_range(range.start, range.end));

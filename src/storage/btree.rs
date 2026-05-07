@@ -59,6 +59,28 @@ fn read_leaf_header(page: &Page) -> Result<LeafPageHeader> {
     Ok(header)
 }
 
+pub struct LeafCell<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+fn read_leaf_cell<'a>(page: &'a Page, index: u16) -> Result<LeafCell<'a>> {
+    page.assert_page_type(PageType::Leaf)?;
+    let header = read_leaf_header(page)?;
+    // TODO: proper error handling
+    if index >= header.record_count {
+        return Err(ShuError::IndexOutOfRange);
+    }
+    let pointer_offset = leaf_cell_pointer_offset(index);
+    let cell_start = page.read_body_u16(pointer_offset)? as usize;
+    let key_len = page.read_body_u16(cell_start)?;
+    let value_len = page.read_body_u16(cell_start + 2)?;
+    let layout = LeafCellLayout::new(cell_start, key_len, value_len);
+    let key = page.read_body_bytes(layout.key_start..layout.key_end)?;
+    let value = page.read_body_bytes(layout.value_start..layout.value_end)?;
+    Ok(LeafCell { key, value })
+}
+
 fn insert_into_empty_leaf(page: &mut Page, key: &[u8], value: &[u8]) -> Result<()> {
     page.assert_page_type(PageType::Leaf)?;
     let mut header = read_leaf_header(page)?;
@@ -185,5 +207,27 @@ mod tests {
         let layout = LeafCellLayout::new(cell_start, key_len, value_len);
         assert_eq!(&body[layout.key_start..layout.key_end], b"abc");
         assert_eq!(&body[layout.value_start..layout.value_end], b"hello");
+    }
+
+    #[test]
+    fn read_leaf_cell_returns_inserted_key_and_value() {
+        let mut page = Page::new(PageType::Leaf, PageId::new(1));
+        init_leaf_page(&mut page).unwrap();
+        insert_into_empty_leaf(&mut page, b"abc", b"hello").unwrap();
+
+        let cell = read_leaf_cell(&page, 0).unwrap();
+
+        assert_eq!(cell.key, b"abc");
+        assert_eq!(cell.value, b"hello");
+    }
+
+    #[test]
+    fn read_leaf_cell_rejects_index_past_record_count() {
+        let mut page = Page::new(PageType::Leaf, PageId::new(1));
+        init_leaf_page(&mut page).unwrap();
+
+        let result = read_leaf_cell(&page, 0);
+
+        assert!(matches!(result, Err(ShuError::IndexOutOfRange)));
     }
 }
