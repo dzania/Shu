@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 
 use bytemuck::{from_bytes, from_bytes_mut};
 
@@ -126,6 +127,46 @@ impl Page {
         &mut self.data[HEADER_SIZE..]
     }
 
+    pub fn write_body_u16(&mut self, offset: usize, value: u16) -> Result<()> {
+        let end = offset
+            .checked_add(size_of::<u16>())
+            .ok_or_else(|| self.invalid_body_range(offset, usize::MAX))?;
+        self.write_body_bytes(offset..end, &value.to_le_bytes())
+    }
+
+    pub fn write_body_bytes(&mut self, range: Range<usize>, bytes: &[u8]) -> Result<()> {
+        self.validate_body_range(&range)?;
+        let range_len = range.end - range.start;
+        if range_len != bytes.len() {
+            return Err(ShuError::BodyWriteLengthMismatch {
+                page_id: self.id(),
+                range_len,
+                bytes_len: bytes.len(),
+            });
+        }
+
+        let body = self.body_mut();
+        body[range].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn validate_body_range(&self, range: &Range<usize>) -> Result<()> {
+        if range.start > range.end || range.end > self.body().len() {
+            return Err(self.invalid_body_range(range.start, range.end));
+        }
+
+        Ok(())
+    }
+
+    fn invalid_body_range(&self, start: usize, end: usize) -> ShuError {
+        ShuError::InvalidBodyRange {
+            page_id: self.id(),
+            start,
+            end,
+            body_len: self.body().len(),
+        }
+    }
+
     pub fn read_body_prefix<T: bytemuck::Pod>(&self) -> Result<T> {
         let len = size_of::<T>();
         if len > self.body().len() {
@@ -143,5 +184,44 @@ impl Page {
 
         self.body_mut()[..len].copy_from_slice(bytemuck::bytes_of(value));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_body_bytes_rejects_range_past_body_end() {
+        let mut page = Page::new(PageType::Leaf, PageId::new(7));
+        let body_len = page.body().len();
+
+        let result = page.write_body_bytes(body_len..body_len + 1, &[1]);
+
+        assert!(matches!(
+            result,
+            Err(ShuError::InvalidBodyRange {
+                page_id: PageId(7),
+                start,
+                end,
+                body_len: len,
+            }) if start == body_len && end == body_len + 1 && len == body_len
+        ));
+    }
+
+    #[test]
+    fn write_body_bytes_rejects_length_mismatch() {
+        let mut page = Page::new(PageType::Leaf, PageId::new(7));
+
+        let result = page.write_body_bytes(0..2, &[1]);
+
+        assert!(matches!(
+            result,
+            Err(ShuError::BodyWriteLengthMismatch {
+                page_id: PageId(7),
+                range_len: 2,
+                bytes_len: 1,
+            })
+        ));
     }
 }

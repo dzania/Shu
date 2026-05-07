@@ -14,6 +14,21 @@ pub enum ShuError {
     InvalidPageType,
     #[error("index out of range")]
     IndexOutOfRange,
+    #[error("invalid page {page_id} body range {start}..{end} for body length {body_len}")]
+    InvalidBodyRange {
+        page_id: PageId,
+        start: usize,
+        end: usize,
+        body_len: usize,
+    },
+    #[error(
+        "page {page_id} body write length mismatch: range has {range_len} bytes, input has {bytes_len} bytes"
+    )]
+    BodyWriteLengthMismatch {
+        page_id: PageId,
+        range_len: usize,
+        bytes_len: usize,
+    },
     #[error("cell is too large for page {page_id}: key {key_len} bytes, value {value_len} bytes")]
     CellTooLarge {
         page_id: PageId,
