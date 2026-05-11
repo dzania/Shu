@@ -134,6 +134,24 @@ impl Page {
         self.write_body_bytes(offset..end, &value.to_le_bytes())
     }
 
+    pub fn copy_body_within(&mut self, range: Range<usize>, dst_start: usize) -> Result<()> {
+        self.validate_body_range(&range)?;
+        if range
+            .len()
+            .checked_add(dst_start)
+            .ok_or_else(|| self.invalid_body_range(range.start, range.end))?
+            > self.body().len()
+        {
+            return Err(ShuError::BodyWriteLengthMismatch {
+                page_id: self.id(),
+                range_len: range.len(),
+                bytes_len: dst_start,
+            });
+        }
+        self.body_mut().copy_within(range, dst_start);
+        Ok(())
+    }
+
     pub fn write_body_bytes(&mut self, range: Range<usize>, bytes: &[u8]) -> Result<()> {
         self.validate_body_range(&range)?;
         let range_len = range.end - range.start;
@@ -151,12 +169,23 @@ impl Page {
     }
 
     pub(crate) fn read_body_u16(&self, offset: usize) -> Result<u16> {
+        let page_id = self.id();
         let end = offset + size_of::<u16>();
-        assert!(end < self.body().len());
-        // FIXME: Handle error properly
-        Ok(u16::from_le_bytes(
-            self.body()[offset..end].try_into().unwrap(),
-        ))
+        let body_len = self.body().len();
+        if end >= body_len {
+            return Err(ShuError::InvalidBodyRange {
+                page_id,
+                start: offset,
+                end,
+                body_len,
+            });
+        }
+        let range = u16::from_le_bytes(
+            self.body()[offset..end]
+                .try_into()
+                .map_err(|_| ShuError::PageNotFound { page_id })?,
+        );
+        Ok(range)
     }
 
     pub(crate) fn read_body_bytes(&self, range: Range<usize>) -> Result<&[u8]> {
