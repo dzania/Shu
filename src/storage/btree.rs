@@ -1,9 +1,9 @@
-use std::{cmp::Ordering, mem::size_of, path::Path, usize};
+use std::{mem::size_of, path::Path};
 
 use crate::{
     error::{Result, ShuError},
     storage::{
-        page::{PAGE_SIZE, Page, PageId, PageType},
+        page::{Page, PageId, PageType},
         pager::Pager,
     },
 };
@@ -22,10 +22,45 @@ pub struct LeafCell<'a> {
 
 #[derive(Debug, Eq, PartialEq)]
 enum SearchResult {
-    // Replace key
     Found(u16),
-    // Key doesn't exist insert
     Missing(u16),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LeafInsertPosition {
+    index: u16,
+    is_new_key: bool,
+}
+
+impl LeafInsertPosition {
+    fn from_search(result: SearchResult) -> Self {
+        match result {
+            SearchResult::Found(index) => Self {
+                index,
+                is_new_key: false,
+            },
+            SearchResult::Missing(index) => Self {
+                index,
+                is_new_key: true,
+            },
+        }
+    }
+
+    fn pointer_offset(self) -> usize {
+        leaf_cell_pointer_offset(self.index)
+    }
+
+    fn pointer_space_needed(self) -> usize {
+        if self.is_new_key {
+            CELL_POINTER_SIZE
+        } else {
+            0
+        }
+    }
+
+    fn needs_pointer_shift(self, record_count: u16) -> bool {
+        self.is_new_key && self.index != record_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -39,6 +74,7 @@ struct LeafPageHeader {
 
 #[derive(Clone, Copy, Debug)]
 struct LeafCellLayout {
+    cell_start: usize,
     key_len_start: usize,
     value_len_start: usize,
     key_start: usize,
@@ -57,6 +93,7 @@ impl LeafCellLayout {
         let value_end = value_start + usize::from(value_len);
 
         Self {
+            cell_start,
             key_len_start,
             value_len_start,
             key_start,
@@ -74,12 +111,22 @@ impl BTree {
         })
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<()> {
-        todo!()
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let page = self.pager.read_page(self.pager.root_page_id())?;
+        match search_leaf(&page, key)? {
+            SearchResult::Found(index) => {
+                let cell = read_leaf_cell(&page, index)?;
+                Ok(Some(cell.value.to_owned()))
+            }
+            SearchResult::Missing(_) => Ok(None),
+        }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        todo!()
+        let root_page_id = self.pager.root_page_id();
+        let mut page = self.pager.read_page(root_page_id)?;
+        insert_into_leaf(&mut page, key, value)?;
+        self.pager.write_page(root_page_id, &page)
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -114,7 +161,6 @@ fn read_leaf_header(page: &Page) -> Result<LeafPageHeader> {
 fn read_leaf_cell<'a>(page: &'a Page, index: u16) -> Result<LeafCell<'a>> {
     page.assert_page_type(PageType::Leaf)?;
     let header = read_leaf_header(page)?;
-    // TODO: proper error handling
     if index >= header.record_count {
         return Err(ShuError::IndexOutOfRange);
     }
@@ -132,40 +178,66 @@ fn insert_into_leaf(page: &mut Page, key: &[u8], value: &[u8]) -> Result<()> {
     page.assert_page_type(PageType::Leaf)?;
     let mut header = read_leaf_header(page)?;
     let (key_len, value_len) = checked_cell_lens(page.id(), key.len(), value.len())?;
-    let cell_size = leaf_cell_size(key_len, value_len);
-    let cell_start = usize::from(header.record_content_start) - cell_size;
+    let position = LeafInsertPosition::from_search(search_leaf(page, key)?);
+    let cell_start = allocate_leaf_cell_start(page.id(), &header, key_len, value_len, position)?;
     let layout = LeafCellLayout::new(cell_start, key_len, value_len);
-    let (cell_index, is_new_key) = match search_leaf(page, key)? {
-        SearchResult::Found(index) => (index, false),
-        SearchResult::Missing(index) => (index, true),
-    };
-    let pointer_offset = leaf_cell_pointer_offset(cell_index);
-    let pointer_end = pointer_offset + CELL_POINTER_SIZE;
-    if pointer_end > cell_start {
-        panic!("Page full -> this will not happen in the future this is placeholder")
-    }
-    if cell_size > header.record_content_start as usize {
-        panic!("Page full panic this won't happen soon")
+
+    if position.needs_pointer_shift(header.record_count) {
+        shift_leaf_pointers(page, position.index, header.record_count)?;
     }
 
-    if is_new_key && cell_index != header.record_count {
-        shift_leaf_pointers(page, cell_index, header.record_count)?;
-    }
+    write_leaf_cell(page, position, &layout, key_len, value_len, key, value)?;
 
-    page.write_body_u16(pointer_offset, cell_start as u16)?;
-
-    // write key len and value
-    page.write_body_u16(layout.key_len_start, key_len)?;
-    page.write_body_u16(layout.value_len_start, value_len)?;
-    // write key and value data
-    page.write_body_bytes(layout.key_start..layout.key_end, key)?;
-    page.write_body_bytes(layout.value_start..layout.value_end, value)?;
-    if is_new_key {
+    if position.is_new_key {
         header.record_count += 1;
     }
-    header.record_content_start = cell_start as u16;
-    page.write_body_prefix(&header)?;
+    header.record_content_start = layout.cell_start as u16;
+    page.write_body_prefix(&header)
+}
 
+fn allocate_leaf_cell_start(
+    page_id: PageId,
+    header: &LeafPageHeader,
+    key_len: u16,
+    value_len: u16,
+    position: LeafInsertPosition,
+) -> Result<usize> {
+    let cell_size = leaf_cell_size(key_len, value_len);
+    let available = leaf_free_space(page_id, header)?;
+    let needed = position.pointer_space_needed() + cell_size;
+
+    if needed > available {
+        return Err(ShuError::PageFull {
+            page_id,
+            needed,
+            available,
+        });
+    }
+
+    Ok(usize::from(header.record_content_start) - cell_size)
+}
+
+fn leaf_free_space(page_id: PageId, header: &LeafPageHeader) -> Result<usize> {
+    let pointer_end = leaf_cell_pointer_offset(header.record_count);
+    usize::from(header.record_content_start)
+        .checked_sub(pointer_end)
+        .ok_or(ShuError::CorruptedPage { page_id })
+}
+
+fn write_leaf_cell(
+    page: &mut Page,
+    position: LeafInsertPosition,
+    layout: &LeafCellLayout,
+    key_len: u16,
+    value_len: u16,
+    key: &[u8],
+    value: &[u8],
+) -> Result<()> {
+    page.write_body_u16(position.pointer_offset(), layout.cell_start as u16)?;
+    page.write_body_u16(layout.key_len_start, key_len)?;
+    page.write_body_u16(layout.value_len_start, value_len)?;
+    page.write_body_bytes(layout.key_start..layout.key_end, key)?;
+    page.write_body_bytes(layout.value_start..layout.value_end, value)?;
     Ok(())
 }
 
@@ -296,5 +368,31 @@ mod tests {
         assert_eq!(search_leaf(&page, b"b").unwrap(), SearchResult::Missing(1));
         assert_eq!(search_leaf(&page, b"d").unwrap(), SearchResult::Missing(2));
         assert_eq!(search_leaf(&page, b"zz").unwrap(), SearchResult::Missing(3));
+    }
+
+    #[test]
+    fn btree_put_get_round_trip_on_root_leaf() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut tree = BTree::open(&path).unwrap();
+        tree.put(b"cat", b"meow").unwrap();
+
+        assert_eq!(tree.get(b"cat").unwrap(), Some(b"meow".to_vec()));
+        assert_eq!(tree.get(b"dog").unwrap(), None);
+    }
+
+    #[test]
+    fn btree_put_replaces_existing_root_leaf_value() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut tree = BTree::open(&path).unwrap();
+        tree.put(b"cat", b"meow").unwrap();
+        tree.put(b"cat", b"purr").unwrap();
+
+        assert_eq!(tree.get(b"cat").unwrap(), Some(b"purr".to_vec()));
     }
 }
