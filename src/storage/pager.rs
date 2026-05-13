@@ -4,7 +4,7 @@ use crate::{
     error::{Result, ShuError},
     storage::{
         FileStorage,
-        btree::init_leaf_page,
+        btree::{init_internal_page, init_leaf_page},
         header::{DatabaseHeader, FREELIST_DEFAULT, INITIAL_ROOT_PAGE_ID},
         page::{Page, PageId, PageType},
     },
@@ -98,8 +98,10 @@ impl Pager {
     pub fn allocate(&mut self, page_type: PageType) -> Result<PageId> {
         let page_id = PageId::new(self.page_count);
         let mut page = Page::new(page_type, page_id);
-        if page_type == PageType::Leaf {
-            init_leaf_page(&mut page)?;
+        match page_type {
+            PageType::Internal => init_internal_page(&mut page)?,
+            PageType::Leaf => init_leaf_page(&mut page)?,
+            PageType::Meta => {}
         }
         self.storage.write_page(page_id, &page)?;
         self.page_count += 1;
@@ -194,6 +196,20 @@ mod tests {
 
         let page = pager.read_page(id2).unwrap();
         assert_eq!(page.header().page_id, id2);
+    }
+
+    #[test]
+    fn allocate_initializes_internal_pages() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page_id = pager.allocate(PageType::Internal).unwrap();
+
+        let page = pager.read_page(page_id).unwrap();
+        assert_eq!(page.header().page_type, PageType::Internal as u8);
+        assert_eq!(page.body()[..8], [0, 0, 240, 15, 0, 0, 0, 0]);
     }
 
     #[test]

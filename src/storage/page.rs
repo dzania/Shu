@@ -170,9 +170,11 @@ impl Page {
 
     pub(crate) fn read_body_u16(&self, offset: usize) -> Result<u16> {
         let page_id = self.id();
-        let end = offset + size_of::<u16>();
+        let end = offset
+            .checked_add(size_of::<u16>())
+            .ok_or_else(|| self.invalid_body_range(offset, usize::MAX))?;
         let body_len = self.body().len();
-        if end >= body_len {
+        if end > body_len {
             return Err(ShuError::InvalidBodyRange {
                 page_id,
                 start: offset,
@@ -267,5 +269,15 @@ mod tests {
                 bytes_len: 1,
             })
         ));
+    }
+
+    #[test]
+    fn read_body_u16_allows_value_ending_at_body_end() {
+        let mut page = Page::new(PageType::Leaf, PageId::new(7));
+        let offset = page.body().len() - size_of::<u16>();
+
+        page.write_body_u16(offset, 0x1234).unwrap();
+
+        assert_eq!(page.read_body_u16(offset).unwrap(), 0x1234);
     }
 }
