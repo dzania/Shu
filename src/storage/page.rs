@@ -1,5 +1,4 @@
-use std::fmt;
-use std::ops::Range;
+use std::{fmt, ops::Range};
 
 use bytemuck::{from_bytes, from_bytes_mut};
 
@@ -47,6 +46,7 @@ impl fmt::Display for PageId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PageType {
+    /// FIXME: Remove meta page
     Meta = 1,
     Internal = 2,
     Leaf = 3,
@@ -82,6 +82,7 @@ pub struct PageHeader {
 } // total: 16 byte
 
 // Lowest level page frame
+// TODO: Add domain enum so we don't need to assert PageType
 #[repr(C, align(4))]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
