@@ -34,7 +34,8 @@ impl FileStorage {
         Ok(page)
     }
 
-    pub(crate) fn write_page(&mut self, page_id: PageId, page: &Page) -> Result<()> {
+    pub(crate) fn write_page(&mut self, page: &Page) -> Result<()> {
+        let page_id = page.id();
         let offset = page_id.as_u64() * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&page.data)?;

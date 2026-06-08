@@ -53,10 +53,10 @@ impl Pager {
                 _reserved: [0; 4],
             };
             header.write_to(&mut meta_page)?;
-            storage.write_page(META_PAGE_ID, &meta_page)?;
+            storage.write_page(&meta_page)?;
             let mut root_page = Page::new(PageType::Leaf, INITIAL_ROOT_PAGE_ID);
             init_leaf_page(&mut root_page)?;
-            storage.write_page(INITIAL_ROOT_PAGE_ID, &root_page)?;
+            storage.write_page(&root_page)?;
 
             Ok(Self {
                 page_count: 2,
@@ -84,18 +84,19 @@ impl Pager {
     }
 
     fn write_meta(&mut self, page: &Page) -> Result<()> {
-        self.storage.write_page(META_PAGE_ID, page)
+        self.storage.write_page(page)
     }
 
-    pub fn write_page(&mut self, page_id: PageId, page: &Page) -> Result<()> {
+    pub fn write_page(&mut self, page: &Page) -> Result<()> {
+        let page_id = page.id();
         if page_id.get() >= self.page_count {
             return Err(ShuError::PageNotFound { page_id });
         }
 
-        self.storage.write_page(page_id, page)
+        self.storage.write_page(page)
     }
 
-    pub fn allocate(&mut self, page_type: PageType) -> Result<PageId> {
+    pub fn allocate(&mut self, page_type: PageType) -> Result<Page> {
         let page_id = PageId::new(self.page_count);
         let mut page = Page::new(page_type, page_id);
         match page_type {
@@ -103,10 +104,10 @@ impl Pager {
             PageType::Leaf => init_leaf_page(&mut page)?,
             PageType::Meta => {}
         }
-        self.storage.write_page(page_id, &page)?;
+        self.storage.write_page(&page)?;
         self.page_count += 1;
         self.flush_meta()?;
-        Ok(page_id)
+        Ok(page)
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -187,15 +188,15 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let id1 = pager.allocate(PageType::Leaf).unwrap();
-        let id2 = pager.allocate(PageType::Leaf).unwrap();
+        let page1 = pager.allocate(PageType::Leaf).unwrap();
+        let page2 = pager.allocate(PageType::Leaf).unwrap();
 
-        assert_eq!(id1, PageId::new(2));
-        assert_eq!(id2, PageId::new(3));
+        assert_eq!(page1.id(), PageId::new(2));
+        assert_eq!(page2.id(), PageId::new(3));
         assert_eq!(pager.page_count, 4);
 
-        let page = pager.read_page(id2).unwrap();
-        assert_eq!(page.header().page_id, id2);
+        let page = pager.read_page(page2.id()).unwrap();
+        assert_eq!(page.header().page_id, page2.id());
     }
 
     #[test]
@@ -205,7 +206,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let page_id = pager.allocate(PageType::Internal).unwrap();
+        let page_id = pager.allocate(PageType::Internal).unwrap().id();
 
         let page = pager.read_page(page_id).unwrap();
         assert_eq!(page.header().page_type, PageType::Internal as u8);
@@ -219,11 +220,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let id = pager.allocate(PageType::Leaf).unwrap();
+        let id = pager.allocate(PageType::Leaf).unwrap().id();
 
         let mut page = pager.read_page(id).unwrap();
         page.body_mut()[..5].copy_from_slice(b"hello");
-        pager.write_page(id, &page).unwrap();
+        pager.write_page(&page).unwrap();
 
         let page2 = pager.read_page(id).unwrap();
         assert_eq!(&page2.body()[..5], b"hello");

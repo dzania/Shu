@@ -26,6 +26,15 @@ struct OwnedLeafCell {
     value: Vec<u8>,
 }
 
+impl OwnedLeafCell {
+    pub fn new(key: &[u8], value: &[u8]) -> Self {
+        Self {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+}
+
 /// Borrowed internal-page cell.
 ///
 /// The cell stores the child page to follow for keys up to the separator `key`.
@@ -186,10 +195,8 @@ impl BTree {
         let search_result = self.search(key)?;
         let mut page = search_result.leaf;
         match insert_into_leaf(&mut page, key, value) {
-            Ok(()) => self.pager.write_page(page.id(), &page),
-            Err(error @ ShuError::PageFull { .. }) => {
-                self.balance(page, search_result.path, key, value, error)
-            }
+            Ok(()) => self.pager.write_page(&page),
+            Err(ShuError::PageFull { .. }) => self.balance(page, &search_result.path, key, value),
             Err(error) => Err(error),
         }
     }
@@ -228,28 +235,27 @@ impl BTree {
     fn balance(
         &mut self,
         mut page: Page,
-        path: Vec<PathFrame>,
+        path: &[PathFrame],
         key: &[u8],
         value: &[u8],
-        overflow_error: ShuError,
     ) -> Result<()> {
         if page.id() == self.pager.root_page_id() {
             let root_page_id = page.id();
             let child_page_id = self.balance_root(&mut page)?;
-            let child = self.pager.read_page(child_page_id)?;
+            let mut child = self.pager.read_page(child_page_id)?;
             let path = [PathFrame {
                 page_id: root_page_id,
                 child_index: 0,
             }];
-            return self.balance_non_root(child, &path, key, value, overflow_error);
+            return self.balance_non_root(&mut child, &path, key, value);
         }
 
-        self.balance_non_root(page, &path, key, value, overflow_error)
+        self.balance_non_root(&mut page, &path, key, value)
     }
 
     fn balance_root(&mut self, root: &mut Page) -> Result<PageId> {
         let new_page_type = root.page_type()?;
-        let child_page_id = self.pager.allocate(new_page_type)?;
+        let child_page_id = self.pager.allocate(new_page_type)?.id();
         let mut child = self.pager.read_page(child_page_id)?;
 
         child.body_mut().copy_from_slice(root.body());
@@ -260,103 +266,44 @@ impl BTree {
             right_child: child_page_id,
         };
         write_internal_header(root, &root_header)?;
-        self.pager.write_page(child.id(), &child)?;
-        self.pager.write_page(root.id(), root)?;
+        self.pager.write_page(&child)?;
+        self.pager.write_page(root)?;
         Ok(child_page_id)
     }
 
     fn balance_non_root(
         &mut self,
-        page: Page,
+        page: &mut Page,
         path: &[PathFrame],
         key: &[u8],
         value: &[u8],
-        overflow_error: ShuError,
     ) -> Result<()> {
         let parent_frame = path
             .last()
             .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
-        let parent = self.pager.read_page(parent_frame.page_id)?;
-
-        match page.page_type()? {
-            PageType::Leaf => self.split_rightmost_leaf_child(
-                parent,
-                parent_frame.child_index,
-                page,
-                key,
-                value,
-                overflow_error,
-            ),
-            PageType::Internal | PageType::Meta => Err(overflow_error),
-        }
-    }
-
-    fn split_rightmost_leaf_child(
-        &mut self,
-        mut parent: Page,
-        child_index: u16,
-        page: Page,
-        key: &[u8],
-        value: &[u8],
-        overflow_error: ShuError,
-    ) -> Result<()> {
-        let parent_header = read_internal_header(&parent)?;
-        if child_index != parent_header.record_count {
-            return Err(overflow_error);
-        }
-
-        let old_leaf_header = read_leaf_header(&page)?;
-        let mut records = collect_leaf_records(&page)?;
+        let mut parent = self.pager.read_page(parent_frame.page_id)?;
+        let child_index = parent_frame.child_index;
+        let mut records = collect_leaf_records(page)?;
         upsert_leaf_record(&mut records, key, value);
-        if records.len() < 2 {
-            return Err(overflow_error);
-        }
-
-        let split_index = records.len() / 2;
-        let left_records = &records[..split_index];
-        let right_records = &records[split_index..];
-        let separator_key = left_records
+        let mid = records.len() / 2;
+        let (left, right) = records.split_at(mid);
+        // FIXME: Fuck it we ball
+        let separator = &left
             .last()
             .ok_or(ShuError::CorruptedPage { page_id: page.id() })?
-            .key
-            .as_slice();
-        let separator_key_len = checked_internal_key_len(parent.id(), separator_key.len())?;
-        allocate_internal_cell_start(parent.id(), &parent_header, separator_key_len)?;
+            .key;
+        let mut left_page = self.pager.allocate(PageType::Leaf)?;
+        write_leaf_records(&mut left_page, left)?;
+        // Clean old page
+        init_leaf_page(page)?;
+        write_leaf_records(page, right)?;
+        insert_internal_cell(&mut parent, child_index, left_page.id(), separator)?;
 
-        let mut left = Page::new(PageType::Leaf, page.id());
-        init_leaf_page(&mut left)?;
-        write_leaf_records(&mut left, left_records)?;
+        self.pager.write_page(&left_page)?;
+        self.pager.write_page(page)?;
+        self.pager.write_page(&parent)?;
 
-        let right_page_id = self.pager.allocate(PageType::Leaf)?;
-        let mut right = self.pager.read_page(right_page_id)?;
-        write_leaf_records(&mut right, right_records)?;
-
-        let mut left_header = read_leaf_header(&left)?;
-        left_header.left_sibling = old_leaf_header.left_sibling;
-        left_header.right_sibling = right_page_id;
-        left.write_body_prefix(&left_header)?;
-
-        let mut right_header = read_leaf_header(&right)?;
-        right_header.left_sibling = left.id();
-        right_header.right_sibling = old_leaf_header.right_sibling;
-        right.write_body_prefix(&right_header)?;
-
-        if old_leaf_header.right_sibling != PageId::new(0) {
-            let mut old_right = self.pager.read_page(old_leaf_header.right_sibling)?;
-            let mut old_right_header = read_leaf_header(&old_right)?;
-            old_right_header.left_sibling = right_page_id;
-            old_right.write_body_prefix(&old_right_header)?;
-            self.pager.write_page(old_right.id(), &old_right)?;
-        }
-
-        append_internal_cell(&mut parent, left.id(), separator_key)?;
-        let mut parent_header = read_internal_header(&parent)?;
-        parent_header.right_child = right.id();
-        write_internal_header(&mut parent, &parent_header)?;
-
-        self.pager.write_page(left.id(), &left)?;
-        self.pager.write_page(right.id(), &right)?;
-        self.pager.write_page(parent.id(), &parent)
+        Ok(())
     }
 }
 
@@ -456,13 +403,7 @@ fn collect_leaf_records(page: &Page) -> Result<Vec<OwnedLeafCell>> {
 fn upsert_leaf_record(records: &mut Vec<OwnedLeafCell>, key: &[u8], value: &[u8]) {
     match records.binary_search_by(|record| record.key.as_slice().cmp(key)) {
         Ok(index) => records[index].value = value.to_owned(),
-        Err(index) => records.insert(
-            index,
-            OwnedLeafCell {
-                key: key.to_owned(),
-                value: value.to_owned(),
-            },
-        ),
+        Err(index) => records.insert(index, OwnedLeafCell::new(key, value)),
     }
 }
 
@@ -534,6 +475,27 @@ pub fn append_internal_cell(page: &mut Page, child_page_id: PageId, key: &[u8]) 
         key_len,
         key,
     )?;
+
+    header.record_count += 1;
+    header.record_content_start = layout.cell_start as u16;
+    write_internal_header(page, &header)
+}
+
+pub fn insert_internal_cell(
+    page: &mut Page,
+    index: u16,
+    child_page_id: PageId,
+    separator_key: &[u8],
+) -> Result<()> {
+    page.assert_page_type(PageType::Internal)?;
+    let mut header = read_internal_header(page)?;
+    assert!(index <= header.record_count);
+    let key_len = checked_internal_key_len(page.id(), separator_key.len())?;
+    let cell_start = allocate_internal_cell_start(page.id(), &header, key_len)?;
+    shift_internal_pointers(page, index, header.record_count)?;
+    let layout = InternalCellLayout::new(cell_start, key_len);
+
+    write_internal_cell(page, index, &layout, child_page_id, key_len, separator_key)?;
 
     header.record_count += 1;
     header.record_content_start = layout.cell_start as u16;
@@ -645,6 +607,13 @@ fn read_internal_cell_child_page_id(page: &Page, cell_start: usize) -> Result<Pa
 fn shift_leaf_pointers(page: &mut Page, start_index: u16, record_count: u16) -> Result<()> {
     let start = leaf_cell_pointer_offset(start_index);
     let end = leaf_cell_pointer_offset(record_count);
+    let dst_start = start + CELL_POINTER_SIZE;
+    page.copy_body_within(start..end, dst_start)
+}
+
+fn shift_internal_pointers(page: &mut Page, start_index: u16, record_count: u16) -> Result<()> {
+    let start = internal_cell_pointer_offset(start_index);
+    let end = internal_cell_pointer_offset(record_count);
     let dst_start = start + CELL_POINTER_SIZE;
     page.copy_body_within(start..end, dst_start)
 }
@@ -932,12 +901,12 @@ mod tests {
     }
 
     fn allocate_leaf_with_records(tree: &mut BTree, records: &[(&[u8], &[u8])]) -> PageId {
-        let page_id = tree.pager.allocate(PageType::Leaf).unwrap();
-        let mut page = tree.pager.read_page(page_id).unwrap();
+        let mut page = tree.pager.allocate(PageType::Leaf).unwrap();
+        let page_id = page.id();
         for &(key, value) in records {
             insert_into_leaf(&mut page, key, value).unwrap();
         }
-        tree.pager.write_page(page_id, &page).unwrap();
+        tree.pager.write_page(&page).unwrap();
         page_id
     }
 
@@ -986,7 +955,7 @@ mod tests {
         let mut header = read_internal_header(&root).unwrap();
         header.right_child = right_leaf;
         write_internal_header(&mut root, &header).unwrap();
-        tree.pager.write_page(root_page_id, &root).unwrap();
+        tree.pager.write_page(&root).unwrap();
 
         tree
     }
