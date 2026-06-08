@@ -26,6 +26,12 @@ struct OwnedLeafCell {
     value: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct OwnedInternalEntry {
+    child: PageId,
+    separator: Option<Vec<u8>>,
+}
+
 impl OwnedLeafCell {
     pub fn new(key: &[u8], value: &[u8]) -> Self {
         Self {
@@ -65,6 +71,16 @@ struct TreeSearchResult {
 struct LeafInsertPosition {
     index: u16,
     is_new_key: bool,
+}
+
+enum InsertResult {
+    Done,
+    Split {
+        left_page_id: PageId,
+        // Max key in left child
+        separator_key: Vec<u8>,
+        right_page_id: PageId,
+    },
 }
 
 impl LeafInsertPosition {
@@ -201,6 +217,59 @@ impl BTree {
         }
     }
 
+    fn insert(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertResult> {
+        let mut page = self.pager.read_page(page_id)?;
+
+        match page.page_type()? {
+            PageType::Leaf => match insert_into_leaf(&mut page, key, value) {
+                Ok(()) => {
+                    self.pager.write_page(&page)?;
+                    Ok(InsertResult::Done)
+                }
+                Err(ShuError::PageFull { .. }) => self.split_leaf(&mut page, key, value),
+                Err(error) => Err(error),
+            },
+
+            PageType::Internal => {
+                // find child
+                let child_index = find_child_index_for_key(&page, key)?;
+                let child_page_id = child_page_id_at_index(&page, child_index)?;
+                let child_result = self.insert(child_page_id, key, value)?;
+                match child_result {
+                    InsertResult::Done => Ok(InsertResult::Done),
+                    InsertResult::Split {
+                        left_page_id,
+                        separator_key,
+                        right_page_id: _,
+                    } => {
+                        let result = insert_internal_cell(
+                            &mut page,
+                            child_index,
+                            left_page_id,
+                            &separator_key,
+                        );
+
+                        match result {
+                            Ok(()) => {
+                                self.pager.write_page(&page)?;
+                                Ok(InsertResult::Done)
+                            }
+                            Err(ShuError::PageFull { .. }) => self.split_internal(
+                                &mut page,
+                                child_index,
+                                &left_page_id,
+                                &separator_key,
+                            ),
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+            }
+
+            PageType::Meta => Err(ShuError::InvalidPageType),
+        }
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         self.pager.sync()
     }
@@ -283,27 +352,83 @@ impl BTree {
             .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
         let mut parent = self.pager.read_page(parent_frame.page_id)?;
         let child_index = parent_frame.child_index;
+        let split = self.split_leaf(page, key, value)?;
+
+        match split {
+            InsertResult::Done => Ok(()),
+            InsertResult::Split {
+                left_page_id,
+                separator_key,
+                right_page_id: _,
+            } => {
+                insert_internal_cell(&mut parent, child_index, left_page_id, &separator_key)?;
+                self.pager.write_page(&parent)
+            }
+        }
+    }
+
+    fn split_leaf(&mut self, page: &mut Page, key: &[u8], value: &[u8]) -> Result<InsertResult> {
         let mut records = collect_leaf_records(page)?;
         upsert_leaf_record(&mut records, key, value);
         let mid = records.len() / 2;
         let (left, right) = records.split_at(mid);
-        // FIXME: Fuck it we ball
-        let separator = &left
+        let separator = left
             .last()
             .ok_or(ShuError::CorruptedPage { page_id: page.id() })?
-            .key;
+            .key
+            .to_owned();
         let mut left_page = self.pager.allocate(PageType::Leaf)?;
         write_leaf_records(&mut left_page, left)?;
         // Clean old page
         init_leaf_page(page)?;
         write_leaf_records(page, right)?;
-        insert_internal_cell(&mut parent, child_index, left_page.id(), separator)?;
 
         self.pager.write_page(&left_page)?;
         self.pager.write_page(page)?;
-        self.pager.write_page(&parent)?;
 
-        Ok(())
+        Ok(InsertResult::Split {
+            left_page_id: left_page.id(),
+            right_page_id: page.id(),
+            separator_key: separator,
+        })
+    }
+
+    fn split_internal(
+        &mut self,
+        page: &mut Page,
+        child_index: u16,
+        left_page_id: &PageId,
+        separator_key: &[u8],
+    ) -> Result<InsertResult> {
+        let mut entries = collect_internal_entries(page)?;
+        let new_entry = OwnedInternalEntry {
+            child: *left_page_id,
+            separator: Some(separator_key.to_owned()),
+        };
+        entries.insert(child_index.into(), new_entry);
+        let mid = entries.len() / 2;
+        let (left, right) = entries.split_at(mid);
+        debug_assert!(!right.is_empty());
+
+        let mut left_entries = left.to_owned();
+        let promoted_separator = left_entries
+            .last_mut()
+            .ok_or(ShuError::CorruptedPage { page_id: page.id() })?
+            .separator
+            .take()
+            .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
+        let mut new_left_page = self.pager.allocate(PageType::Internal)?;
+
+        write_internal_entries(&mut new_left_page, &left_entries)?;
+        write_internal_entries(page, right)?;
+        self.pager.write_page(&new_left_page)?;
+        self.pager.write_page(page)?;
+
+        Ok(InsertResult::Split {
+            left_page_id: new_left_page.id(),
+            separator_key: promoted_separator,
+            right_page_id: page.id(),
+        })
     }
 }
 
@@ -400,6 +525,23 @@ fn collect_leaf_records(page: &Page) -> Result<Vec<OwnedLeafCell>> {
     Ok(records)
 }
 
+fn collect_internal_entries(page: &Page) -> Result<Vec<OwnedInternalEntry>> {
+    let header = read_internal_header(page)?;
+    let mut entries = Vec::with_capacity(usize::from(header.record_count + 1));
+    for index in 0..header.record_count {
+        let cell = read_internal_cell(page, index)?;
+        entries.push(OwnedInternalEntry {
+            child: cell.child_page_id,
+            separator: Some(cell.key.to_owned()),
+        });
+    }
+    entries.push(OwnedInternalEntry {
+        child: header.right_child,
+        separator: None,
+    });
+    Ok(entries)
+}
+
 fn upsert_leaf_record(records: &mut Vec<OwnedLeafCell>, key: &[u8], value: &[u8]) {
     match records.binary_search_by(|record| record.key.as_slice().cmp(key)) {
         Ok(index) => records[index].value = value.to_owned(),
@@ -415,6 +557,32 @@ fn write_leaf_records(page: &mut Page, records: &[OwnedLeafCell]) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn write_internal_entries(page: &mut Page, entries: &[OwnedInternalEntry]) -> Result<()> {
+    page.assert_page_type(PageType::Internal)?;
+    // Clean old page entries
+    init_internal_page(page)?;
+
+    let (right_child, cells) = entries
+        .split_last()
+        .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
+
+    if right_child.separator.is_some() {
+        return Err(ShuError::CorruptedPage { page_id: page.id() });
+    }
+
+    for entry in cells {
+        let separator = entry
+            .separator
+            .as_deref()
+            .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
+        append_internal_cell(page, entry.child, separator)?;
+    }
+
+    let mut header = read_internal_header(page)?;
+    header.right_child = right_child.child;
+    write_internal_header(page, &header)
 }
 
 /// Reads an internal-page cell by slot index.
@@ -625,6 +793,7 @@ fn find_child_for_key(page: &Page, new_key: &[u8]) -> Result<PageId> {
     child_page_id_at_index(page, child_index)
 }
 
+/// Returns the child page to follow for `new_key` in an internal page.
 fn find_child_index_for_key(page: &Page, new_key: &[u8]) -> Result<u16> {
     page.assert_page_type(PageType::Internal)?;
     let mut low = 0;
@@ -645,6 +814,7 @@ fn find_child_index_for_key(page: &Page, new_key: &[u8]) -> Result<u16> {
     Ok(low)
 }
 
+/// Reads the child page id at specified index
 fn child_page_id_at_index(page: &Page, child_index: u16) -> Result<PageId> {
     page.assert_page_type(PageType::Internal)?;
     let header = read_internal_header(page)?;
@@ -775,6 +945,59 @@ mod tests {
         let cell = read_internal_cell(&page, 0).unwrap();
         assert_eq!(cell.child_page_id, PageId::new(7));
         assert_eq!(cell.key, b"");
+    }
+
+    #[test]
+    fn write_internal_entries_rewrites_cells_and_right_child() {
+        let mut page = Page::new(PageType::Internal, PageId::new(2));
+        init_internal_page(&mut page).unwrap();
+        append_internal_cell(&mut page, PageId::new(99), b"stale").unwrap();
+
+        let entries = [
+            OwnedInternalEntry {
+                child: PageId::new(10),
+                separator: Some(b"cat".to_vec()),
+            },
+            OwnedInternalEntry {
+                child: PageId::new(11),
+                separator: Some(b"dog".to_vec()),
+            },
+            OwnedInternalEntry {
+                child: PageId::new(12),
+                separator: None,
+            },
+        ];
+
+        write_internal_entries(&mut page, &entries).unwrap();
+
+        let header = read_internal_header(&page).unwrap();
+        assert_eq!(header.record_count, 2);
+        assert_eq!(header.right_child, PageId::new(12));
+
+        let first = read_internal_cell(&page, 0).unwrap();
+        assert_eq!(first.child_page_id, PageId::new(10));
+        assert_eq!(first.key, b"cat");
+
+        let second = read_internal_cell(&page, 1).unwrap();
+        assert_eq!(second.child_page_id, PageId::new(11));
+        assert_eq!(second.key, b"dog");
+    }
+
+    #[test]
+    fn write_internal_entries_rejects_separator_on_right_child_entry() {
+        let mut page = Page::new(PageType::Internal, PageId::new(2));
+        init_internal_page(&mut page).unwrap();
+        let entries = [OwnedInternalEntry {
+            child: PageId::new(10),
+            separator: Some(b"cat".to_vec()),
+        }];
+
+        let result = write_internal_entries(&mut page, &entries);
+
+        assert!(matches!(
+            result,
+            Err(ShuError::CorruptedPage { page_id }) if page_id == PageId::new(2)
+        ));
     }
 
     #[test]
