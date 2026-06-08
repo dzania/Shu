@@ -32,6 +32,24 @@ struct OwnedInternalEntry {
     separator: Option<Vec<u8>>,
 }
 
+struct SplitResult {
+    left_page_id: PageId,
+    separator_key: Vec<u8>,
+}
+
+
+enum Overflow {
+    Leaf {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Internal {
+        child_index: u16,
+        child_page_id: PageId,
+        separator_key: Vec<u8>,
+    },
+}
+
 impl OwnedLeafCell {
     pub fn new(key: &[u8], value: &[u8]) -> Self {
         Self {
@@ -71,16 +89,6 @@ struct TreeSearchResult {
 struct LeafInsertPosition {
     index: u16,
     is_new_key: bool,
-}
-
-enum InsertResult {
-    Done,
-    Split {
-        left_page_id: PageId,
-        // Max key in left child
-        separator_key: Vec<u8>,
-        right_page_id: PageId,
-    },
 }
 
 impl LeafInsertPosition {
@@ -189,6 +197,8 @@ impl InternalCellLayout {
     }
 }
 
+
+
 impl BTree {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
@@ -212,61 +222,8 @@ impl BTree {
         let mut page = search_result.leaf;
         match insert_into_leaf(&mut page, key, value) {
             Ok(()) => self.pager.write_page(&page),
-            Err(ShuError::PageFull { .. }) => self.balance(page, &search_result.path, key, value),
+            Err(ShuError::PageFull { .. }) => self.balance(page, &search_result.path, &Overflow::Leaf { key: key.to_owned(), value: value.to_owned() }),
             Err(error) => Err(error),
-        }
-    }
-
-    fn insert(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertResult> {
-        let mut page = self.pager.read_page(page_id)?;
-
-        match page.page_type()? {
-            PageType::Leaf => match insert_into_leaf(&mut page, key, value) {
-                Ok(()) => {
-                    self.pager.write_page(&page)?;
-                    Ok(InsertResult::Done)
-                }
-                Err(ShuError::PageFull { .. }) => self.split_leaf(&mut page, key, value),
-                Err(error) => Err(error),
-            },
-
-            PageType::Internal => {
-                // find child
-                let child_index = find_child_index_for_key(&page, key)?;
-                let child_page_id = child_page_id_at_index(&page, child_index)?;
-                let child_result = self.insert(child_page_id, key, value)?;
-                match child_result {
-                    InsertResult::Done => Ok(InsertResult::Done),
-                    InsertResult::Split {
-                        left_page_id,
-                        separator_key,
-                        right_page_id: _,
-                    } => {
-                        let result = insert_internal_cell(
-                            &mut page,
-                            child_index,
-                            left_page_id,
-                            &separator_key,
-                        );
-
-                        match result {
-                            Ok(()) => {
-                                self.pager.write_page(&page)?;
-                                Ok(InsertResult::Done)
-                            }
-                            Err(ShuError::PageFull { .. }) => self.split_internal(
-                                &mut page,
-                                child_index,
-                                &left_page_id,
-                                &separator_key,
-                            ),
-                            Err(error) => Err(error),
-                        }
-                    }
-                }
-            }
-
-            PageType::Meta => Err(ShuError::InvalidPageType),
         }
     }
 
@@ -305,8 +262,7 @@ impl BTree {
         &mut self,
         mut page: Page,
         path: &[PathFrame],
-        key: &[u8],
-        value: &[u8],
+        overflow: &Overflow
     ) -> Result<()> {
         if page.id() == self.pager.root_page_id() {
             let root_page_id = page.id();
@@ -316,10 +272,10 @@ impl BTree {
                 page_id: root_page_id,
                 child_index: 0,
             }];
-            return self.balance_non_root(&mut child, &path, key, value);
+            return self.balance_non_root(&mut child, &path);
         }
 
-        self.balance_non_root(&mut page, &path, key, value)
+        self.balance_non_root(&mut page, &path)
     }
 
     fn balance_root(&mut self, root: &mut Page) -> Result<PageId> {
@@ -344,30 +300,22 @@ impl BTree {
         &mut self,
         page: &mut Page,
         path: &[PathFrame],
-        key: &[u8],
-        value: &[u8],
+        overflow: &Overflow
     ) -> Result<()> {
         let parent_frame = path
             .last()
             .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
+
         let mut parent = self.pager.read_page(parent_frame.page_id)?;
         let child_index = parent_frame.child_index;
-        let split = self.split_leaf(page, key, value)?;
 
-        match split {
-            InsertResult::Done => Ok(()),
-            InsertResult::Split {
-                left_page_id,
-                separator_key,
-                right_page_id: _,
-            } => {
-                insert_internal_cell(&mut parent, child_index, left_page_id, &separator_key)?;
-                self.pager.write_page(&parent)
-            }
-        }
+     
+
+
+        self.pager.write_page(&parent)
     }
 
-    fn split_leaf(&mut self, page: &mut Page, key: &[u8], value: &[u8]) -> Result<InsertResult> {
+    fn split_leaf(&mut self, page: &mut Page, key: &[u8], value: &[u8]) -> Result<SplitResult> {
         let mut records = collect_leaf_records(page)?;
         upsert_leaf_record(&mut records, key, value);
         let mid = records.len() / 2;
@@ -386,26 +334,14 @@ impl BTree {
         self.pager.write_page(&left_page)?;
         self.pager.write_page(page)?;
 
-        Ok(InsertResult::Split {
+        Ok(SplitResult {
             left_page_id: left_page.id(),
-            right_page_id: page.id(),
             separator_key: separator,
         })
     }
 
-    fn split_internal(
-        &mut self,
-        page: &mut Page,
-        child_index: u16,
-        left_page_id: &PageId,
-        separator_key: &[u8],
-    ) -> Result<InsertResult> {
-        let mut entries = collect_internal_entries(page)?;
-        let new_entry = OwnedInternalEntry {
-            child: *left_page_id,
-            separator: Some(separator_key.to_owned()),
-        };
-        entries.insert(child_index.into(), new_entry);
+    fn split_internal(&mut self, page: &mut Page) -> Result<SplitResult> {
+        let entries = collect_internal_entries(page)?;
         let mid = entries.len() / 2;
         let (left, right) = entries.split_at(mid);
         debug_assert!(!right.is_empty());
@@ -424,10 +360,9 @@ impl BTree {
         self.pager.write_page(&new_left_page)?;
         self.pager.write_page(page)?;
 
-        Ok(InsertResult::Split {
+        Ok(SplitResult {
             left_page_id: new_left_page.id(),
             separator_key: promoted_separator,
-            right_page_id: page.id(),
         })
     }
 }
@@ -1292,6 +1227,28 @@ mod tests {
         for index in 0..70 {
             let key = format!("key-{index:03}");
             let value = vec![index as u8; 48];
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(value));
+        }
+    }
+
+    #[test]
+    fn btree_put_splits_internal_parent_when_full() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut tree = BTree::open(&path).unwrap();
+
+        for index in 0..700 {
+            let key = format!("key-{index:04}");
+            let value = vec![index as u8; 900];
+            tree.put(key.as_bytes(), &value)
+                .unwrap_or_else(|error| panic!("insert {key} failed: {error}"));
+        }
+
+        for index in 0..700 {
+            let key = format!("key-{index:04}");
+            let value = vec![index as u8; 900];
             assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(value));
         }
     }
