@@ -37,19 +37,6 @@ struct SplitResult {
     separator_key: Vec<u8>,
 }
 
-
-enum Overflow {
-    Leaf {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Internal {
-        child_index: u16,
-        child_page_id: PageId,
-        separator_key: Vec<u8>,
-    },
-}
-
 impl OwnedLeafCell {
     pub fn new(key: &[u8], value: &[u8]) -> Self {
         Self {
@@ -197,8 +184,6 @@ impl InternalCellLayout {
     }
 }
 
-
-
 impl BTree {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
@@ -222,7 +207,10 @@ impl BTree {
         let mut page = search_result.leaf;
         match insert_into_leaf(&mut page, key, value) {
             Ok(()) => self.pager.write_page(&page),
-            Err(ShuError::PageFull { .. }) => self.balance(page, &search_result.path, &Overflow::Leaf { key: key.to_owned(), value: value.to_owned() }),
+            Err(ShuError::PageFull { .. }) => {
+                let split = self.split_leaf(&mut page, key, value)?;
+                self.propagate_split(search_result.path, split)
+            }
             Err(error) => Err(error),
         }
     }
@@ -258,61 +246,49 @@ impl BTree {
         }
     }
 
-    fn balance(
-        &mut self,
-        mut page: Page,
-        path: &[PathFrame],
-        overflow: &Overflow
-    ) -> Result<()> {
-        if page.id() == self.pager.root_page_id() {
-            let root_page_id = page.id();
-            let child_page_id = self.balance_root(&mut page)?;
-            let mut child = self.pager.read_page(child_page_id)?;
-            let path = [PathFrame {
-                page_id: root_page_id,
-                child_index: 0,
-            }];
-            return self.balance_non_root(&mut child, &path);
+    fn propagate_split(&mut self, mut path: Vec<PathFrame>, mut split: SplitResult) -> Result<()> {
+        while let Some(frame) = path.pop() {
+            let mut parent = self.pager.read_page(frame.page_id)?;
+
+            match insert_internal_cell(
+                &mut parent,
+                frame.child_index,
+                split.left_page_id,
+                &split.separator_key,
+            ) {
+                Ok(()) => return self.pager.write_page(&parent),
+                Err(ShuError::PageFull { .. }) => {
+                    split = self.split_internal_with_entry(
+                        &mut parent,
+                        frame.child_index,
+                        split.left_page_id,
+                        &split.separator_key,
+                    )?;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        self.balance_non_root(&mut page, &path)
+        self.create_new_root(split)
     }
 
-    fn balance_root(&mut self, root: &mut Page) -> Result<PageId> {
-        let new_page_type = root.page_type()?;
-        let child_page_id = self.pager.allocate(new_page_type)?.id();
-        let mut child = self.pager.read_page(child_page_id)?;
+    fn create_new_root(&mut self, split: SplitResult) -> Result<()> {
+        let root_page_id = self.pager.root_page_id();
+        let mut root = self.pager.read_page(root_page_id)?;
+        let old_root_page_type = root.page_type()?;
+        let mut right_child = self.pager.allocate(old_root_page_type)?;
 
-        child.body_mut().copy_from_slice(root.body());
+        right_child.body_mut().copy_from_slice(root.body());
         root.header_mut().page_type = PageType::Internal as u8;
-        let root_header = InternalPageHeader {
-            record_count: 0,
-            record_content_start: root.body().len() as u16,
-            right_child: child_page_id,
-        };
-        write_internal_header(root, &root_header)?;
-        self.pager.write_page(&child)?;
-        self.pager.write_page(root)?;
-        Ok(child_page_id)
-    }
+        init_internal_page(&mut root)?;
+        append_internal_cell(&mut root, split.left_page_id, &split.separator_key)?;
 
-    fn balance_non_root(
-        &mut self,
-        page: &mut Page,
-        path: &[PathFrame],
-        overflow: &Overflow
-    ) -> Result<()> {
-        let parent_frame = path
-            .last()
-            .ok_or(ShuError::CorruptedPage { page_id: page.id() })?;
+        let mut header = read_internal_header(&root)?;
+        header.right_child = right_child.id();
+        write_internal_header(&mut root, &header)?;
 
-        let mut parent = self.pager.read_page(parent_frame.page_id)?;
-        let child_index = parent_frame.child_index;
-
-     
-
-
-        self.pager.write_page(&parent)
+        self.pager.write_page(&right_child)?;
+        self.pager.write_page(&root)
     }
 
     fn split_leaf(&mut self, page: &mut Page, key: &[u8], value: &[u8]) -> Result<SplitResult> {
@@ -340,8 +316,34 @@ impl BTree {
         })
     }
 
-    fn split_internal(&mut self, page: &mut Page) -> Result<SplitResult> {
-        let entries = collect_internal_entries(page)?;
+    fn split_internal_with_entry(
+        &mut self,
+        page: &mut Page,
+        child_index: u16,
+        child_page_id: PageId,
+        separator_key: &[u8],
+    ) -> Result<SplitResult> {
+        let mut entries = collect_internal_entries(page)?;
+        if usize::from(child_index) >= entries.len() {
+            return Err(ShuError::IndexOutOfRange);
+        }
+
+        entries.insert(
+            usize::from(child_index),
+            OwnedInternalEntry {
+                child: child_page_id,
+                separator: Some(separator_key.to_owned()),
+            },
+        );
+
+        self.split_internal_entries(page, &entries)
+    }
+
+    fn split_internal_entries(
+        &mut self,
+        page: &mut Page,
+        entries: &[OwnedInternalEntry],
+    ) -> Result<SplitResult> {
         let mid = entries.len() / 2;
         let (left, right) = entries.split_at(mid);
         debug_assert!(!right.is_empty());

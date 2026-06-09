@@ -84,6 +84,7 @@ pub struct PageHeader {
 // Lowest level page frame
 // TODO: Add domain enum so we don't need to assert PageType
 #[repr(C, align(4))]
+#[derive(Clone)]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
 }
