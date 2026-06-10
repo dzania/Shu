@@ -81,22 +81,84 @@ pub struct PageHeader {
     pub _reserved2: [u8; 4], // 4 bytes
 } // total: 16 byte
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PageOverflow {
+    #[default]
+    None,
+    Leaf(Vec<OverflowLeafEntry>),
+    Internal(OverflowInternalEntries),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OverflowLeafEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl OverflowLeafEntry {
+    pub(crate) fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OverflowInternalEntry {
+    pub child: PageId,
+    pub separator: Vec<u8>,
+}
+
+impl OverflowInternalEntry {
+    pub(crate) fn new(child: PageId, separator: impl Into<Vec<u8>>) -> Self {
+        Self {
+            child,
+            separator: separator.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OverflowInternalEntries {
+    pub entries: Vec<OverflowInternalEntry>,
+    pub right_child: PageId,
+}
+
+impl OverflowInternalEntries {
+    pub(crate) fn new(entries: Vec<OverflowInternalEntry>, right_child: PageId) -> Self {
+        Self {
+            entries,
+            right_child,
+        }
+    }
+}
+
 // Lowest level page frame
 // TODO: Add domain enum so we don't need to assert PageType
 #[repr(C, align(4))]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
+    pub(crate) overflow: PageOverflow,
 }
 
 impl Page {
     pub fn new(page_type: PageType, page_id: PageId) -> Self {
         let mut page = Page {
             data: [0_u8; PAGE_SIZE],
+            overflow: PageOverflow::None,
         };
         page.header_mut().page_type = page_type as u8;
         page.header_mut().page_id = page_id;
         page
+    }
+
+    pub(crate) fn from_data(data: [u8; PAGE_SIZE]) -> Self {
+        Self {
+            data,
+            overflow: PageOverflow::None,
+        }
     }
     pub fn header(&self) -> &PageHeader {
         from_bytes(&self.data[..HEADER_SIZE])
@@ -114,6 +176,10 @@ impl Page {
         self.header().page_type.try_into()
     }
 
+    pub fn set_page_type(&mut self, page_type: PageType) {
+        self.header_mut().page_type = page_type.into();
+    }
+
     pub fn assert_page_type(&self, expected: PageType) -> Result<()> {
         if self.page_type()? != expected {
             return Err(ShuError::InvalidPageType);
@@ -127,6 +193,11 @@ impl Page {
 
     pub fn body_mut(&mut self) -> &mut [u8] {
         &mut self.data[HEADER_SIZE..]
+    }
+
+    pub fn copy_body_from(&mut self, source: &Page) {
+        self.body_mut().copy_from_slice(source.body());
+        self.overflow = source.overflow.clone();
     }
 
     pub fn write_body_u16(&mut self, offset: usize, value: u16) -> Result<()> {

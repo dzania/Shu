@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub mod btree;
+pub(crate) mod btree_page;
 pub mod header;
 pub mod page;
 pub mod pager;
@@ -27,11 +28,9 @@ impl FileStorage {
     pub(crate) fn read_page(&mut self, page_id: PageId) -> Result<Page> {
         let offset = page_id.as_u64() * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
-        let mut page = Page {
-            data: [0u8; PAGE_SIZE],
-        };
-        self.file.read_exact(&mut page.data)?;
-        Ok(page)
+        let mut data = [0u8; PAGE_SIZE];
+        self.file.read_exact(&mut data)?;
+        Ok(Page::from_data(data))
     }
 
     pub(crate) fn write_page(&mut self, page: &Page) -> Result<()> {
