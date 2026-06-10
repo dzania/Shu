@@ -14,6 +14,8 @@ pub enum ShuError {
     InvalidPageType,
     #[error("index out of range")]
     IndexOutOfRange,
+    #[error("Rebalance error")]
+    Rebalance,
     #[error("invalid page {page_id} body range {start}..{end} for body length {body_len}")]
     InvalidBodyRange {
         page_id: PageId,

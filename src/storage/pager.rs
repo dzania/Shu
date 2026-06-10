@@ -1,10 +1,10 @@
-use std::{fs::OpenOptions, path::Path};
+use std::{collections::BTreeMap, fs::OpenOptions, path::Path};
 
 use crate::{
     error::{Result, ShuError},
     storage::{
         FileStorage,
-        btree::{init_internal_page, init_leaf_page},
+        btree_page::{init_internal_page, init_leaf_page},
         header::{DatabaseHeader, FREELIST_DEFAULT, INITIAL_ROOT_PAGE_ID},
         page::{Page, PageId, PageType},
     },
@@ -15,9 +15,16 @@ const META_PAGE_ID: PageId = PageId::new(0);
 #[derive(Debug)]
 pub struct Pager {
     pub(crate) page_count: u32,
+    cache: BTreeMap<PageId, CachedPage>,
     storage: FileStorage,
     root_page_id: PageId,
     freelist_head: u32,
+}
+
+#[derive(Debug)]
+struct CachedPage {
+    page: Page,
+    dirty: bool,
 }
 
 impl Pager {
@@ -39,6 +46,7 @@ impl Pager {
 
             Ok(Self {
                 page_count: header.page_count,
+                cache: BTreeMap::new(),
                 freelist_head: header.freelist_head,
                 root_page_id: header.root_page_id,
                 storage,
@@ -60,6 +68,7 @@ impl Pager {
 
             Ok(Self {
                 page_count: 2,
+                cache: BTreeMap::new(),
                 freelist_head: FREELIST_DEFAULT,
                 root_page_id: INITIAL_ROOT_PAGE_ID,
                 storage,
@@ -76,15 +85,27 @@ impl Pager {
             return Err(ShuError::PageNotFound { page_id });
         }
 
-        self.storage.read_page(page_id)
+        if let Some(cached) = self.cache.get(&page_id) {
+            return Ok(cached.page.clone());
+        }
+
+        let page = self.storage.read_page(page_id)?;
+        self.cache.insert(
+            page_id,
+            CachedPage {
+                page: page.clone(),
+                dirty: false,
+            },
+        );
+        Ok(page)
     }
 
     fn read_meta(&mut self) -> Result<Page> {
-        self.storage.read_page(META_PAGE_ID)
+        self.read_page(META_PAGE_ID)
     }
 
     fn write_meta(&mut self, page: &Page) -> Result<()> {
-        self.storage.write_page(page)
+        self.write_page(page)
     }
 
     pub fn write_page(&mut self, page: &Page) -> Result<()> {
@@ -93,7 +114,34 @@ impl Pager {
             return Err(ShuError::PageNotFound { page_id });
         }
 
-        self.storage.write_page(page)
+        self.cache.insert(
+            page_id,
+            CachedPage {
+                page: page.clone(),
+                dirty: true,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
+        if page_id.get() >= self.page_count {
+            return Err(ShuError::PageNotFound { page_id });
+        }
+
+        if !self.cache.contains_key(&page_id) {
+            let page = self.storage.read_page(page_id)?;
+            self.cache
+                .insert(page_id, CachedPage { page, dirty: false });
+        }
+
+        let cached = self
+            .cache
+            .get_mut(&page_id)
+            .ok_or(ShuError::PageNotFound { page_id })?;
+        cached.dirty = true;
+        Ok(&mut cached.page)
     }
 
     pub fn allocate(&mut self, page_type: PageType) -> Result<Page> {
@@ -104,13 +152,20 @@ impl Pager {
             PageType::Leaf => init_leaf_page(&mut page)?,
             PageType::Meta => {}
         }
-        self.storage.write_page(&page)?;
         self.page_count += 1;
+        self.write_page(&page)?;
         self.flush_meta()?;
         Ok(page)
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        for cached in self.cache.values_mut() {
+            if cached.dirty {
+                self.storage.write_page(&cached.page)?;
+                cached.dirty = false;
+            }
+        }
+
         self.storage.sync()
     }
 
