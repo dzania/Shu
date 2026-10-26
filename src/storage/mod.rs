@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    error::Result,
+    error::{Result, ShuError},
     storage::page::{PAGE_SIZE, Page, PageId},
 };
 
@@ -30,14 +30,18 @@ impl FileStorage {
         self.file.seek(SeekFrom::Start(offset))?;
         let mut data = [0u8; PAGE_SIZE];
         self.file.read_exact(&mut data)?;
-        Ok(Page::from_data(data))
+        let page = Page::from_data(data);
+        if page.id() != page_id {
+            return Err(ShuError::CorruptedPage { page_id });
+        }
+        Ok(page)
     }
 
     pub(crate) fn write_page(&mut self, page: &Page) -> Result<()> {
         let page_id = page.id();
         let offset = page_id.as_u64() * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&page.data)?;
+        self.file.write_all(page.as_bytes())?;
         Ok(())
     }
 
