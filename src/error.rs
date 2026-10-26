@@ -14,8 +14,10 @@ pub enum ShuError {
     InvalidPageType,
     #[error("index out of range")]
     IndexOutOfRange,
-    #[error("Rebalance error")]
-    Rebalance,
+    #[error("B-tree depth exceeds {depth_max} levels")]
+    TreeTooDeep { depth_max: usize },
+    #[error("database page count exceeds u32::MAX")]
+    PageCountOverflow,
     #[error("invalid page {page_id} body range {start}..{end} for body length {body_len}")]
     InvalidBodyRange {
         page_id: PageId,

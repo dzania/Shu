@@ -35,7 +35,15 @@ impl PageId {
     pub const fn as_u64(self) -> u64 {
         self.0 as u64
     }
+
+    /// Returns the id as an index into page-id-addressed collections such as the pager cache.
+    pub const fn as_index(self) -> usize {
+        // Lossless: the assertion below guarantees every `u32` fits in `usize`.
+        self.0 as usize
+    }
 }
+
+const _: () = assert!(usize::BITS >= u32::BITS);
 
 impl fmt::Display for PageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -46,7 +54,7 @@ impl fmt::Display for PageId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PageType {
-    /// FIXME: Remove meta page
+    /// Database header page. Never part of the B-tree.
     Meta = 1,
     Internal = 2,
     Leaf = 3,
@@ -73,98 +81,47 @@ impl From<PageType> for u8 {
 
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct PageHeader {
-    pub page_id: PageId,     // 4 bytes
-    pub page_type: u8,       // 1 byte
-    pub _reserved: [u8; 3],  // 3 bytes padding
-    pub checksum: u32,       // 4 bytes
-    pub _reserved2: [u8; 4], // 4 bytes
+struct PageHeader {
+    page_id: PageId,     // 4 bytes
+    page_type: u8,       // 1 byte
+    _reserved: [u8; 3],  // 3 bytes padding
+    checksum: u32,       // 4 bytes
+    _reserved2: [u8; 4], // 4 bytes
 } // total: 16 byte
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) enum PageOverflow {
-    #[default]
-    None,
-    Leaf(Vec<OverflowLeafEntry>),
-    Internal(OverflowInternalEntries),
-}
+const _: () = assert!(size_of::<PageHeader>() == HEADER_SIZE);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OverflowLeafEntry {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-}
-
-impl OverflowLeafEntry {
-    pub(crate) fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
-        Self {
-            key: key.into(),
-            value: value.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OverflowInternalEntry {
-    pub child: PageId,
-    pub separator: Vec<u8>,
-}
-
-impl OverflowInternalEntry {
-    pub(crate) fn new(child: PageId, separator: impl Into<Vec<u8>>) -> Self {
-        Self {
-            child,
-            separator: separator.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OverflowInternalEntries {
-    pub entries: Vec<OverflowInternalEntry>,
-    pub right_child: PageId,
-}
-
-impl OverflowInternalEntries {
-    pub(crate) fn new(entries: Vec<OverflowInternalEntry>, right_child: PageId) -> Self {
-        Self {
-            entries,
-            right_child,
-        }
-    }
-}
-
-// Lowest level page frame
-// TODO: Add domain enum so we don't need to assert PageType
+/// Lowest level page frame: the exact bytes stored on disk. Typed access to B-tree pages goes
+/// through the node views in `btree_page`.
 #[repr(C, align(4))]
 #[derive(Clone, Debug)]
 pub struct Page {
-    pub data: [u8; PAGE_SIZE],
-    pub(crate) overflow: PageOverflow,
+    data: [u8; PAGE_SIZE],
 }
 
 impl Page {
     pub fn new(page_type: PageType, page_id: PageId) -> Self {
         let mut page = Page {
             data: [0_u8; PAGE_SIZE],
-            overflow: PageOverflow::None,
         };
-        page.header_mut().page_type = page_type as u8;
+        page.header_mut().page_type = page_type.into();
         page.header_mut().page_id = page_id;
         page
     }
 
     pub(crate) fn from_data(data: [u8; PAGE_SIZE]) -> Self {
-        Self {
-            data,
-            overflow: PageOverflow::None,
-        }
+        Self { data }
     }
-    pub fn header(&self) -> &PageHeader {
+
+    pub(crate) fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
+        &self.data
+    }
+
+    fn header(&self) -> &PageHeader {
         from_bytes(&self.data[..HEADER_SIZE])
     }
 
-    pub fn header_mut(&mut self) -> &mut PageHeader {
+    fn header_mut(&mut self) -> &mut PageHeader {
         from_bytes_mut(&mut self.data[..HEADER_SIZE])
     }
 
@@ -180,13 +137,6 @@ impl Page {
         self.header_mut().page_type = page_type.into();
     }
 
-    pub fn assert_page_type(&self, expected: PageType) -> Result<()> {
-        if self.page_type()? != expected {
-            return Err(ShuError::InvalidPageType);
-        }
-        Ok(())
-    }
-
     pub fn body(&self) -> &[u8] {
         &self.data[HEADER_SIZE..]
     }
@@ -195,9 +145,10 @@ impl Page {
         &mut self.data[HEADER_SIZE..]
     }
 
-    pub fn copy_body_from(&mut self, source: &Page) {
+    /// Copies the page type and body from `source`, keeping this page's id.
+    pub fn copy_contents_from(&mut self, source: &Page) {
+        self.header_mut().page_type = source.header().page_type;
         self.body_mut().copy_from_slice(source.body());
-        self.overflow = source.overflow.clone();
     }
 
     pub fn write_body_u16(&mut self, offset: usize, value: u16) -> Result<()> {

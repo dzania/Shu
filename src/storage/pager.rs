@@ -1,10 +1,10 @@
-use std::{collections::BTreeMap, fs::OpenOptions, path::Path};
+use std::{fs::OpenOptions, path::Path};
 
 use crate::{
     error::{Result, ShuError},
     storage::{
         FileStorage,
-        btree_page::{init_internal_page, init_leaf_page},
+        btree_page::{InternalNodeMut, LeafNodeMut, NodeKind},
         header::{DatabaseHeader, FREELIST_DEFAULT, INITIAL_ROOT_PAGE_ID},
         page::{Page, PageId, PageType},
     },
@@ -15,7 +15,9 @@ const META_PAGE_ID: PageId = PageId::new(0);
 #[derive(Debug)]
 pub struct Pager {
     pub(crate) page_count: u32,
-    cache: BTreeMap<PageId, CachedPage>,
+    /// Indexed by page id. Boxed so growing the vector moves pointers, not 4 KiB pages.
+    // TODO: Bound the cache. It holds every page touched since open.
+    cache: Vec<Option<Box<CachedPage>>>,
     storage: FileStorage,
     root_page_id: PageId,
     freelist_head: u32,
@@ -46,7 +48,7 @@ impl Pager {
 
             Ok(Self {
                 page_count: header.page_count,
-                cache: BTreeMap::new(),
+                cache: Vec::new(),
                 freelist_head: header.freelist_head,
                 root_page_id: header.root_page_id,
                 storage,
@@ -63,12 +65,12 @@ impl Pager {
             header.write_to(&mut meta_page)?;
             storage.write_page(&meta_page)?;
             let mut root_page = Page::new(PageType::Leaf, INITIAL_ROOT_PAGE_ID);
-            init_leaf_page(&mut root_page)?;
+            LeafNodeMut::init(&mut root_page)?;
             storage.write_page(&root_page)?;
 
             Ok(Self {
                 page_count: 2,
-                cache: BTreeMap::new(),
+                cache: Vec::new(),
                 freelist_head: FREELIST_DEFAULT,
                 root_page_id: INITIAL_ROOT_PAGE_ID,
                 storage,
@@ -80,86 +82,51 @@ impl Pager {
         self.root_page_id
     }
 
-    pub fn read_page(&mut self, page_id: PageId) -> Result<Page> {
-        if page_id.get() >= self.page_count {
-            return Err(ShuError::PageNotFound { page_id });
-        }
-
-        if let Some(cached) = self.cache.get(&page_id) {
-            return Ok(cached.page.clone());
-        }
-
-        let page = self.storage.read_page(page_id)?;
-        self.cache.insert(
-            page_id,
-            CachedPage {
-                page: page.clone(),
-                dirty: false,
-            },
-        );
-        Ok(page)
+    /// Returns the cached page, reading it from disk on first access. Borrowing instead of
+    /// cloning keeps a 4 KiB copy off every tree level of every lookup.
+    pub fn read_page(&mut self, page_id: PageId) -> Result<&Page> {
+        Ok(&self.cached(page_id)?.page)
     }
 
-    fn read_meta(&mut self) -> Result<Page> {
-        self.read_page(META_PAGE_ID)
-    }
-
-    fn write_meta(&mut self, page: &Page) -> Result<()> {
-        self.write_page(page)
-    }
-
-    pub fn write_page(&mut self, page: &Page) -> Result<()> {
-        let page_id = page.id();
-        if page_id.get() >= self.page_count {
-            return Err(ShuError::PageNotFound { page_id });
-        }
-
-        self.cache.insert(
-            page_id,
-            CachedPage {
-                page: page.clone(),
-                dirty: true,
-            },
-        );
-
-        Ok(())
-    }
-
+    /// Returns the cached page for modification and marks it dirty.
     pub fn get_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
-        if page_id.get() >= self.page_count {
-            return Err(ShuError::PageNotFound { page_id });
-        }
-
-        if !self.cache.contains_key(&page_id) {
-            let page = self.storage.read_page(page_id)?;
-            self.cache
-                .insert(page_id, CachedPage { page, dirty: false });
-        }
-
-        let cached = self
-            .cache
-            .get_mut(&page_id)
-            .ok_or(ShuError::PageNotFound { page_id })?;
+        let cached = self.cached(page_id)?;
         cached.dirty = true;
         Ok(&mut cached.page)
     }
 
-    pub fn allocate(&mut self, page_type: PageType) -> Result<Page> {
+    pub fn write_page(&mut self, page: &Page) -> Result<()> {
+        self.get_mut(page.id())?.clone_from(page);
+        Ok(())
+    }
+
+    /// Appends a formatted, empty page of `kind` and returns its id.
+    pub(crate) fn allocate(&mut self, kind: NodeKind) -> Result<PageId> {
         let page_id = PageId::new(self.page_count);
-        let mut page = Page::new(page_type, page_id);
-        match page_type {
-            PageType::Internal => init_internal_page(&mut page)?,
-            PageType::Leaf => init_leaf_page(&mut page)?,
-            PageType::Meta => {}
+        self.page_count = self
+            .page_count
+            .checked_add(1)
+            .ok_or(ShuError::PageCountOverflow)?;
+
+        let mut cached = Box::new(CachedPage {
+            page: Page::new(kind.into(), page_id),
+            dirty: true,
+        });
+        match kind {
+            NodeKind::Leaf => {
+                LeafNodeMut::init(&mut cached.page)?;
+            }
+            NodeKind::Internal => {
+                InternalNodeMut::init(&mut cached.page)?;
+            }
         }
-        self.page_count += 1;
-        self.write_page(&page)?;
+        *cache_slot(&mut self.cache, page_id) = Some(cached);
         self.flush_meta()?;
-        Ok(page)
+        Ok(page_id)
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        for cached in self.cache.values_mut() {
+        for cached in self.cache.iter_mut().flatten() {
             if cached.dirty {
                 self.storage.write_page(&cached.page)?;
                 cached.dirty = false;
@@ -169,16 +136,44 @@ impl Pager {
         self.storage.sync()
     }
 
-    fn flush_meta(&mut self) -> Result<()> {
-        let mut meta_page = self.read_meta()?;
-        let mut header = DatabaseHeader::read_from(&meta_page)?;
-        header.page_count = self.page_count;
-        header.root_page_id = self.root_page_id;
-        header.freelist_head = self.freelist_head;
-        header.write_to(&mut meta_page)?;
-        self.write_meta(&meta_page)?;
-        Ok(())
+    fn cached(&mut self, page_id: PageId) -> Result<&mut CachedPage> {
+        if page_id.get() >= self.page_count {
+            return Err(ShuError::PageNotFound { page_id });
+        }
+
+        let slot = cache_slot(&mut self.cache, page_id);
+        if slot.is_none() {
+            let page = self.storage.read_page(page_id)?;
+            *slot = Some(Box::new(CachedPage { page, dirty: false }));
+        }
+        slot.as_deref_mut()
+            .ok_or(ShuError::PageNotFound { page_id })
     }
+
+    fn flush_meta(&mut self) -> Result<()> {
+        let page_count = self.page_count;
+        let root_page_id = self.root_page_id;
+        let freelist_head = self.freelist_head;
+        let meta_page = self.get_mut(META_PAGE_ID)?;
+        let mut header = DatabaseHeader::read_from(meta_page)?;
+        header.page_count = page_count;
+        header.root_page_id = root_page_id;
+        header.freelist_head = freelist_head;
+        header.write_to(meta_page)
+    }
+}
+
+/// Returns the cache slot for `page_id`, growing the cache to cover it. A free function so callers
+/// can keep using other `Pager` fields while holding the slot.
+fn cache_slot(
+    cache: &mut Vec<Option<Box<CachedPage>>>,
+    page_id: PageId,
+) -> &mut Option<Box<CachedPage>> {
+    let index = page_id.as_index();
+    if index >= cache.len() {
+        cache.resize_with(index + 1, || None);
+    }
+    &mut cache[index]
 }
 
 #[cfg(test)]
@@ -206,8 +201,8 @@ mod tests {
 
         let mut pager = Pager::open(&path).unwrap();
         let meta = pager.read_page(PageId::new(0)).unwrap();
-        assert_eq!(meta.header().page_id, PageId::new(0));
-        assert_eq!(meta.header().page_type, PageType::Meta as u8);
+        assert_eq!(meta.id(), PageId::new(0));
+        assert_eq!(meta.page_type().unwrap(), PageType::Meta);
     }
 
     #[test]
@@ -218,8 +213,8 @@ mod tests {
 
         let mut pager = Pager::open(&path).unwrap();
         let root = pager.read_page(INITIAL_ROOT_PAGE_ID).unwrap();
-        assert_eq!(root.header().page_id, INITIAL_ROOT_PAGE_ID);
-        assert_eq!(root.header().page_type, PageType::Leaf as u8);
+        assert_eq!(root.id(), INITIAL_ROOT_PAGE_ID);
+        assert_eq!(root.page_type().unwrap(), PageType::Leaf);
     }
 
     #[test]
@@ -230,7 +225,7 @@ mod tests {
 
         let mut pager = Pager::open(&path).unwrap();
         let meta = pager.read_page(META_PAGE_ID).unwrap();
-        let header = DatabaseHeader::read_from(&meta).unwrap();
+        let header = DatabaseHeader::read_from(meta).unwrap();
 
         assert_eq!(header.root_page_id, INITIAL_ROOT_PAGE_ID);
         assert_eq!(header.page_count, 2);
@@ -243,15 +238,15 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let page1 = pager.allocate(PageType::Leaf).unwrap();
-        let page2 = pager.allocate(PageType::Leaf).unwrap();
+        let page1 = pager.allocate(NodeKind::Leaf).unwrap();
+        let page2 = pager.allocate(NodeKind::Leaf).unwrap();
 
-        assert_eq!(page1.id(), PageId::new(2));
-        assert_eq!(page2.id(), PageId::new(3));
+        assert_eq!(page1, PageId::new(2));
+        assert_eq!(page2, PageId::new(3));
         assert_eq!(pager.page_count, 4);
 
-        let page = pager.read_page(page2.id()).unwrap();
-        assert_eq!(page.header().page_id, page2.id());
+        let page = pager.read_page(page2).unwrap();
+        assert_eq!(page.id(), page2);
     }
 
     #[test]
@@ -261,10 +256,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let page_id = pager.allocate(PageType::Internal).unwrap().id();
+        let page_id = pager.allocate(NodeKind::Internal).unwrap();
 
         let page = pager.read_page(page_id).unwrap();
-        assert_eq!(page.header().page_type, PageType::Internal as u8);
+        assert_eq!(page.page_type().unwrap(), PageType::Internal);
         assert_eq!(page.body()[..8], [0, 0, 240, 15, 0, 0, 0, 0]);
     }
 
@@ -275,9 +270,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let mut pager = Pager::open(&path).unwrap();
-        let id = pager.allocate(PageType::Leaf).unwrap().id();
+        let id = pager.allocate(NodeKind::Leaf).unwrap();
 
-        let mut page = pager.read_page(id).unwrap();
+        let mut page = pager.read_page(id).unwrap().clone();
         page.body_mut()[..5].copy_from_slice(b"hello");
         pager.write_page(&page).unwrap();
 
@@ -293,12 +288,50 @@ mod tests {
 
         {
             let mut pager = Pager::open(&path).unwrap();
-            pager.allocate(PageType::Leaf).unwrap();
-            pager.allocate(PageType::Internal).unwrap();
+            pager.allocate(NodeKind::Leaf).unwrap();
+            pager.allocate(NodeKind::Internal).unwrap();
             pager.sync().unwrap();
         }
 
         let pager = Pager::open(&path).unwrap();
         assert_eq!(pager.page_count, 4); // meta + root + 2 allocated
+    }
+
+    #[test]
+    fn read_page_rejects_ids_past_page_count() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut pager = Pager::open(&path).unwrap();
+
+        assert!(matches!(
+            pager.read_page(PageId::new(2)),
+            Err(ShuError::PageNotFound { .. })
+        ));
+        assert!(matches!(
+            pager.get_mut(PageId::new(2)),
+            Err(ShuError::PageNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn reopen_reads_synced_page_contents() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let id = {
+            let mut pager = Pager::open(&path).unwrap();
+            let id = pager.allocate(NodeKind::Leaf).unwrap();
+            pager.get_mut(id).unwrap().body_mut()[100..105].copy_from_slice(b"hello");
+            pager.sync().unwrap();
+            id
+        };
+
+        let mut pager = Pager::open(&path).unwrap();
+        let page = pager.read_page(id).unwrap();
+        assert_eq!(page.id(), id);
+        assert_eq!(&page.body()[100..105], b"hello");
     }
 }
